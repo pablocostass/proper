@@ -1206,6 +1206,7 @@ inner_test(RawTest, Opts) ->
 
 -spec perform_with_nodes(test(), opts()) -> imm_result().
 perform_with_nodes(Test, #opts{numtests = NumTests, num_processes = NumProcesses} = Opts) ->
+    maybe_suggest_speedup(Opts),
     {forall, {_, TList}, _Fun} = Test,
     NumProcsList = assign_tests_on_list(NumTests, NumProcesses),
     NodeList =
@@ -2023,6 +2024,21 @@ apply_skip(Args, Prop) ->
 %%-----------------------------------------------------------------------------
 %% Output functions
 %%-----------------------------------------------------------------------------
+
+-spec maybe_suggest_speedup(opts()) -> ok.
+maybe_suggest_speedup(#opts{output_fun = Print, nocolors = NoColors,
+        num_processes = NumProcesses}) ->
+    SuggestedNumber = erlang:system_info(logical_processors_available),
+    case NumProcesses rem SuggestedNumber of
+        0 -> ok;
+        _ ->
+        case NoColors of
+        true ->
+            Print("num_processes should be a multiple of ~p to maximize the speedup.~n", [SuggestedNumber]);
+        false ->
+            Print("\033[1;32mnum_processes should be a multiple of ~p to maximize the speedup.~n\033[0m", [SuggestedNumber])
+        end
+    end.
 
 -spec aggregate_imm_result(list(pid()), imm_result()) -> imm_result().
 aggregate_imm_result([], ImmResult) ->
