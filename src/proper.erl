@@ -1232,6 +1232,7 @@ perform_with_nodes(Test, #opts{numtests = NumTests, num_workers = NumWorkers} = 
             Nodes = start_nodes(NumWorkers),
             lists:zip(Nodes, TestsPerProcess)
     end,
+    ok = ?disable_logging(),
     SpawnFun = fun({Node,N}) ->
         spawn_link_migrate(Node, fun() -> perform(N, Test, Opts) end)
     end,
