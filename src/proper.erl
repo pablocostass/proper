@@ -1221,7 +1221,6 @@ property_type(_) -> false.
 %% avoid test collisions between them.
 -spec perform_with_nodes(test(), opts()) -> imm_result().
 perform_with_nodes(Test, #opts{numtests = NumTests, num_workers = NumWorkers} = Opts) ->
-    maybe_suggest_speedup(Opts),
     TestsPerProcess = tests_per_worker(NumTests, NumWorkers),
     NodeList =
     case property_type(Test) of
@@ -2050,21 +2049,6 @@ apply_skip(Args, Prop) ->
 %%-----------------------------------------------------------------------------
 %% Output functions
 %%-----------------------------------------------------------------------------
-
--spec maybe_suggest_speedup(opts()) -> ok.
-maybe_suggest_speedup(#opts{output_fun = Print, nocolors = NoColors,
-        num_workers = NumWorkers}) ->
-    SuggestedNumber = erlang:system_info(logical_processors_available),
-    case NumWorkers rem SuggestedNumber of
-        0 -> ok;
-        _ ->
-        case NoColors of
-        true ->
-            Print("num_workers should be a multiple of ~p to maximize the speedup.~n", [SuggestedNumber]);
-        false ->
-            Print("\033[1;32mnum_workers should be a multiple of ~p to maximize the speedup.~n\033[0m", [SuggestedNumber])
-        end
-    end.
 
 -spec aggregate_imm_result(list(pid()), imm_result()) -> imm_result().
 aggregate_imm_result([], ImmResult) ->
