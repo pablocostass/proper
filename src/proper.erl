@@ -1240,12 +1240,14 @@ perform_with_nodes(Test, #opts{numtests = NumTests, num_workers = NumWorkers} = 
             lists:map(fun(N) -> {Node, N} end, TestsPerProcess)
     end,
     ok = ?disable_logging(),
+    {ok, _} = maybe_start_cover_server(NodeList),
     SpawnFun = fun({Node,N}) ->
         spawn_link_migrate(Node, fun() -> perform(N, Test, Opts) end)
     end,
     ProcList = lists:map(SpawnFun, NodeList),
     InitialResult = #pass{samples = [], printers = [], actions = []},
     Aggregate = aggregate_imm_result(ProcList, InitialResult),
+    ok = maybe_stop_cover_server(NodeList),
     ok = stop_nodes(),
     Aggregate.
 
@@ -2324,6 +2326,24 @@ start_node(SlaveName) ->
             _ = update_slave_node_ref({Node, {already_running, true}}),
             ensure_code_loaded(Node),
             Node
+    end.
+
+-spec maybe_start_cover_server([tuple()]) -> {'ok', [node()]}.
+maybe_start_cover_server(NodeList) ->
+    case os:getenv("COVER") of
+        false -> {ok, []};
+        "true" ->
+            {Nodes, _} = lists:unzip(NodeList),
+            cover:start(Nodes)
+    end.
+
+-spec maybe_stop_cover_server([node()]) -> 'ok'.
+maybe_stop_cover_server(NodeList) ->
+    case os:getenv("COVER") of
+        false -> ok;
+        "true" ->
+            {Nodes, _} = lists:unzip(NodeList),
+            cover:stop(Nodes)
     end.
 
 code_load(Node, Module) ->
