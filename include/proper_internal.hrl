@@ -60,7 +60,7 @@
 %% Error logging
 %%------------------------------------------------------------------------------
 
--ifdef(AT_LEAST_21).
+-ifdef(OTP_RELEASE).
 -define(disable_logging(), 
     logger:set_primary_config(filters,
                               [{no_sasl,
