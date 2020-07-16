@@ -404,6 +404,9 @@
 
 -include("proper_internal.hrl").
 
+% No need to warn of this for now
+-dialyzer({no_unused, [size_at_nth_test/2, perform/4]}).
+
 %%-----------------------------------------------------------------------------
 %% Macros
 %%-----------------------------------------------------------------------------
@@ -664,6 +667,33 @@ tests_at_next_size(Size, #opts{numtests = NumTests, start_size = StartSize,
 			PrevMultiple + EverySoManySizes
 		end,
 	    {1, NextSize}
+    end.
+
+-spec size_at_nth_test(non_neg_integer(), opts()) -> proper_gen:size().
+size_at_nth_test(NumTest, #opts{max_size = MaxSize, start_size = StartSize,
+                 numtests = NumTests}) ->
+    SizesToTest = MaxSize - StartSize + 1,
+    Size = case NumTests >= SizesToTest of
+        true ->
+            Div = NumTests div SizesToTest,
+            Rem = NumTests rem SizesToTest,
+            case NumTest < Rem * (Div + 1) of
+                true ->
+                    NumTest div (Div + 1) + StartSize;
+                false ->
+                    (NumTest div 2) - (Rem div Div) + StartSize
+            end;
+        false ->
+            case NumTest == 0 of
+                true -> StartSize;
+                false ->
+                    Diff = (SizesToTest - 1) div (NumTests - 1),
+                    NumTest * Diff + StartSize
+            end
+    end,
+    case Size >= MaxSize of
+        true -> MaxSize;
+        false -> Size
     end.
 
 %% @private
@@ -1227,19 +1257,19 @@ property_type(_) -> {}.
 %% avoid test collisions between them.
 -spec perform_with_nodes(test(), opts()) -> imm_result().
 perform_with_nodes(Test, #opts{numtests = NumTests, num_workers = NumWorkers} = Opts) ->
-    TestsPerProcess = tests_per_worker(NumTests, NumWorkers),
+    TestsPerWorker = tests_per_worker(NumTests, NumWorkers),
     NodeList =
     case property_type(Test) of
         {kind, Type} when Type =:= constructed; Type =:= wrapper ->
             % stateful or simulated annealing
             Nodes = start_nodes(NumWorkers),
             ensure_code_loaded(Nodes),
-            lists:zip(Nodes, TestsPerProcess);
+            lists:zip(Nodes, TestsPerWorker);
         _ ->
             % stateless
             [Node] = start_nodes(1),
             ensure_code_loaded([Node]),
-            lists:map(fun(N) -> {Node, N} end, TestsPerProcess)
+            lists:map(fun(N) -> {Node, N} end, TestsPerWorker)
     end,
     ok = ?disable_logging(),
     {ok, _} = maybe_start_cover_server(NodeList),
@@ -1363,12 +1393,19 @@ check_if_early_fail(Passed, Samples) ->
         after 0 -> ok
     end.
 
+-spec perform(non_neg_integer(), test(), opts()) -> imm_result().
 perform(NumTests, Test, Opts) ->
+    perform(0, NumTests, ?MAX_TRIES_FACTOR * NumTests, Test, none, none, Opts).
+
+-spec perform(non_neg_integer(), pos_integer(), test(), opts()) -> imm_result() | 'ok'.
+perform(Passed, NumTests, Test, Opts) ->
+    Size = size_at_nth_test(Passed, Opts),
+    put('$size', Size),
     perform(0, NumTests, ?MAX_TRIES_FACTOR * NumTests, Test, none, none, Opts).
 
 -spec perform(non_neg_integer(), pos_integer(), non_neg_integer(), test(),
 	      [sample()] | 'none', [stats_printer()] | 'none', opts()) ->
-      imm_result() | ok.
+      imm_result() | 'ok'.
 perform(Passed, _ToPass, 0, _Test, Samples, Printers,
         #opts{num_workers = NumWorkers, parent = From} = _Opts) when NumWorkers > 0 ->
     R = case Passed of
@@ -2113,6 +2150,11 @@ aggregate_imm_result(WorkerList, #pass{performed = Passed, samples = Samples} = 
         {worker_msg, #pass{} = Received, From, Id} when Passed == undefined ->
             aggregate_imm_result(WorkerList -- [From], Received);
         % from that moment on, we accumulate the count of passed tests
+        {worker_msg, #pass{performed = PassedRcvd, samples = SamplesRcvd}, From, Id}
+                when Samples == [none] ->
+            NewImmResult = ImmResult#pass{performed = Passed + PassedRcvd,
+                                          samples = SamplesRcvd},
+            aggregate_imm_result(WorkerList -- [From], NewImmResult);
         {worker_msg, #pass{performed = PassedRcvd, samples = SamplesRcvd}, From, Id} ->
             NewImmResult = ImmResult#pass{performed = Passed + PassedRcvd,
                                           samples = Samples ++ SamplesRcvd},
@@ -2121,14 +2163,14 @@ aggregate_imm_result(WorkerList, #pass{performed = Passed, samples = Samples} = 
             lists:foreach(fun(P) ->
                             P ! {worker_msg, {failed_test, self()}, Id} end,
                     WorkerList -- [From]),
-            Sum = lists:foldl(fun(Process, Sum) ->
+            Performed = lists:foldl(fun(Worker, Acc) ->
                                 receive
-                                    {worker_msg, {performed, P, Id}} -> P + Sum;
-                                    {worker_msg, #fail{performed = FailedOn2}, Process, Id} -> FailedOn2 + Sum
+                                    {worker_msg, {performed, P, Id}} -> P + Acc;
+                                    {worker_msg, #fail{performed = FailedOn2}, Worker, Id} -> FailedOn2 + Acc
                                 end
                              end, 0, WorkerList -- [From]),
             kill_workers(WorkerList),
-            aggregate_imm_result([], Received#fail{performed = Sum + FailedOn});
+            aggregate_imm_result([], Received#fail{performed = Performed + FailedOn});
         {worker_msg, {error, _Reason} = Error, _From, Id} ->
             kill_workers(WorkerList),
             aggregate_imm_result([], Error);
