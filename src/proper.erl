@@ -404,9 +404,6 @@
 
 -include("proper_internal.hrl").
 
-% No need to warn of this for now
--dialyzer({no_unused, [size_at_nth_test/2, perform/4]}).
-
 %%-----------------------------------------------------------------------------
 %% Macros
 %%-----------------------------------------------------------------------------
@@ -1287,8 +1284,8 @@ perform_with_nodes(Test, #opts{numtests = NumTests, num_workers = NumWorkers} = 
     end,
     ok = ?disable_logging(),
     {ok, _} = maybe_start_cover_server(NodeList),
-    SpawnFun = fun({Node,N}) ->
-        spawn_link_migrate(Node, fun() -> perform(N, Test, Opts) end)
+    SpawnFun = fun({Node,{Start, End}}) ->
+        spawn_link_migrate(Node, fun() -> perform(Start, End, Test, Opts) end)
     end,
     WorkerList = lists:map(SpawnFun, NodeList),
     InitialResult = #pass{samples = [], printers = [], actions = []},
@@ -2342,21 +2339,21 @@ report_shrinking(NumShrinks, MinImmTestCase, MinActions, Opts) ->
     print_imm_testcase(MinImmTestCase, "", Print),
     execute_actions(MinActions).
 
--spec tests_per_worker(list(pos_integer()), non_neg_integer(), list(pos_integer())) -> list(pos_integer()).
-tests_per_worker(L, 0, []) -> L;
-tests_per_worker(L, 0, Acc) -> Acc ++ L;
-tests_per_worker([], Extras, Acc) -> tests_per_worker(Acc, Extras, []);
-tests_per_worker([H|T], Extras, Acc) -> tests_per_worker(T, Extras - 1, Acc ++ [H + 1]).
+-spec tests_per_worker(WorkersLeft, Tuple, Acc) -> Acc
+      when  WorkersLeft :: non_neg_integer(),
+            Tuple :: {non_neg_integer(), non_neg_integer(), non_neg_integer()},
+            Acc :: [{non_neg_integer(), non_neg_integer()}].
+tests_per_worker(0, _, Acc) -> lists:reverse(Acc);
+tests_per_worker(WorkersLeft, {Const, Passed, 0}, Acc) ->
+    tests_per_worker(WorkersLeft - 1, {Const, Passed + Const, 0}, [{Passed, Const}|Acc]);
+tests_per_worker(WorkersLeft, {Const, Passed, Extras}, Acc) ->
+    tests_per_worker(WorkersLeft - 1, {Const, Passed + Const + 1, Extras - 1}, [{Passed, Const + 1}|Acc]).
 
--spec tests_per_worker(pos_integer(), non_neg_integer()) -> list(pos_integer()).
-tests_per_worker(NumTests, NumWorkers) when NumTests < NumWorkers ->
-    BaseList = lists:map(fun(_X) -> 1 end, lists:seq(1, NumTests)),
-    tests_per_worker(BaseList, 0, []);
+-spec tests_per_worker(pos_integer(), non_neg_integer()) -> [{non_neg_integer(), non_neg_integer()}].
 tests_per_worker(NumTests, NumWorkers) ->
     Const = NumTests div NumWorkers,
     Extras = NumTests rem NumWorkers,
-    BaseList = lists:map(fun(_X) -> Const end, lists:seq(1, NumWorkers)),
-    tests_per_worker(BaseList, Extras, []).
+    tests_per_worker(NumWorkers, {Const, 0, Extras}, []).
 
 %% @private
 -spec update_slave_node_ref({node(), {already_running, boolean()}}) -> list(node()).
