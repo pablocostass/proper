@@ -404,9 +404,6 @@
 
 -include("proper_internal.hrl").
 
-% No need to warn of this for now
--dialyzer({no_unused, [size_at_nth_test/2, perform/4]}).
-
 %%-----------------------------------------------------------------------------
 %% Macros
 %%-----------------------------------------------------------------------------
@@ -1272,7 +1269,7 @@ property_type(_) -> {}.
 %% avoid test collisions between them.
 -spec perform_with_nodes(test(), opts()) -> imm_result().
 perform_with_nodes(Test, #opts{numtests = NumTests, num_workers = NumWorkers} = Opts) ->
-    TestsPerWorker = tests_per_worker(NumTests, NumWorkers),
+    TestsPerWorker = test_list_per_worker(NumTests, NumWorkers),
     NodeList = case property_type(Test) of
         {kind, Type} when Type =:= constructed; Type =:= wrapper ->
             % stateful or simulated annealing
@@ -1287,12 +1284,12 @@ perform_with_nodes(Test, #opts{numtests = NumTests, num_workers = NumWorkers} = 
     end,
     ok = ?disable_logging(),
     {ok, _} = maybe_start_cover_server(NodeList),
-    SpawnFun = fun({Node,N}) ->
-        spawn_link_migrate(Node, fun() -> perform(N, Test, Opts) end)
+    SpawnFun = fun({Node, TestList}) ->
+        spawn_link_migrate(Node, fun() -> perform(TestList, Test, Opts) end)
     end,
     WorkerList = lists:map(SpawnFun, NodeList),
     InitialResult = #pass{samples = [], printers = [], actions = []},
-    AggregatedImmResult = aggregate_imm_result(WorkerList, InitialResult),
+    AggregatedImmResult = aggregate_imm_result({NumTests, WorkerList}, InitialResult),
     ok = maybe_stop_cover_server(NodeList),
     ok = stop_nodes(),
     AggregatedImmResult.
@@ -1397,19 +1394,35 @@ get_rerun_result(#fail{}) ->
 get_rerun_result({error,_Reason} = ErrorResult) ->
     ErrorResult.
 
--spec check_if_early_fail(non_neg_integer()) -> 'ok'.
-check_if_early_fail(Passed) ->
+-spec check_if_early_fail() -> 'ok'.
+check_if_early_fail() ->
     Id = get('$property_id'),
     receive
         {worker_msg, {failed_test, From}, Id} ->
+            Passed = get('$tests_passed'),
             From ! {worker_msg, {performed, Passed, Id}},
             ok
         after 0 -> ok
     end.
 
--spec perform(non_neg_integer(), test(), opts()) -> imm_result().
-perform(NumTests, Test, Opts) ->
-    perform(0, NumTests, ?MAX_TRIES_FACTOR * NumTests, Test, none, none, Opts).
+-spec update_tests_passed(non_neg_integer()) -> non_neg_integer().
+update_tests_passed(Passed) ->
+    case get('$tests_passed') of
+        undefined -> put('$tests_passed', Passed);
+        Passed2 -> put('$tests_passed', Passed + Passed2)
+    end.
+
+-spec perform(Tests, test(), opts()) -> imm_result() | 'ok'
+    when Tests :: NumTests | TestList,
+         NumTests :: non_neg_integer(),
+         TestList :: [NumTests].
+perform(NumTests, Test, Opts) when is_number(NumTests) ->
+    perform(0, NumTests, ?MAX_TRIES_FACTOR * NumTests, Test, none, none, Opts);
+perform(TestList, Test, Opts) when is_list(TestList) ->
+    lists:foreach(fun(TestNumber) ->
+                      perform(TestNumber, 1, Test, Opts)
+                  end, TestList),
+    ok.
 
 -spec perform(non_neg_integer(), pos_integer(), test(), opts()) -> imm_result() | 'ok'.
 perform(Passed, NumTests, Test, Opts) ->
@@ -1426,6 +1439,7 @@ perform(Passed, _ToPass, 0, _Test, Samples, Printers,
         0 -> {error, cant_satisfy};
         _ -> #pass{samples = Samples, printers = Printers, performed = Passed, actions = []}
     end,
+    update_tests_passed(Passed),
     From ! {worker_msg, R, self(), get('$property_id')},
     ok;
 perform(Passed, _ToPass, 0, _Test, Samples, Printers, _Opts) ->
@@ -1436,14 +1450,14 @@ perform(Passed, _ToPass, 0, _Test, Samples, Printers, _Opts) ->
 perform(ToPass, ToPass, _TriesLeft, _Test, Samples, Printers,
         #opts{num_workers = NumWorkers, parent = From} = _Opts) when NumWorkers > 0 ->
     R = #pass{samples = Samples, printers = Printers, performed = ToPass, actions = []},
-    check_if_early_fail(ToPass),
+    check_if_early_fail(),
     From ! {worker_msg, R, self(), get('$property_id')},
     ok;
 perform(ToPass, ToPass, _TriesLeft, _Test, Samples, Printers, _Opts) ->
     #pass{samples = Samples, printers = Printers, performed = ToPass, actions = []};
 perform(Passed, ToPass, TriesLeft, Test, Samples, Printers,
         #opts{output_fun = Print, num_workers = NumWorkers, parent = From} = Opts) when NumWorkers > 0 ->
-    check_if_early_fail(Passed),
+    check_if_early_fail(),
     case run(Test, Opts) of
 	#pass{reason = true_prop, samples = MoreSamples,
 	      printers = MorePrinters} ->
@@ -1454,11 +1468,15 @@ perform(Passed, ToPass, TriesLeft, Test, Samples, Printers,
 			      _    -> Printers
 			  end,
 	    grow_size(Opts),
+        update_tests_passed(Passed + 1),
 	    perform(Passed + 1, ToPass, TriesLeft - 1, Test,
 		    NewSamples, NewPrinters, Opts);
 	#fail{} = FailResult ->
 	    Print("!", []),
-        R = FailResult#fail{performed = Passed + 1},
+        R = case get('$tests_passed') of
+            undefined -> FailResult#fail{performed = Passed + 1};
+            Passed2 -> FailResult#fail{performed = Passed + Passed2 + 1}
+        end,
         From ! {worker_msg, R, self(), get('$property_id')},
         ok;
     {error, rejected} ->
@@ -2154,25 +2172,25 @@ apply_skip(Args, Prop) ->
 %% Output functions
 %%-----------------------------------------------------------------------------
 
--spec aggregate_imm_result(list(pid()), imm_result()) -> imm_result().
-aggregate_imm_result([], ImmResult) ->
+-spec aggregate_imm_result({non_neg_integer(), [pid()]}, imm_result()) -> imm_result().
+aggregate_imm_result({0, _WorkerList}, ImmResult) ->
     ImmResult;
-aggregate_imm_result(WorkerList, #pass{performed = Passed, samples = Samples} = ImmResult) ->
+aggregate_imm_result({NumTests, WorkerList}, #pass{performed = Passed, samples = Samples} = ImmResult) ->
     Id = get('$property_id'),
     receive
         % if we haven't received anything yet we use the first pass
-        {worker_msg, #pass{} = Received, From, Id} when Passed == undefined ->
-            aggregate_imm_result(WorkerList -- [From], Received);
+        {worker_msg, #pass{} = Received, _From, Id} when Passed == undefined ->
+            aggregate_imm_result({NumTests - 1, WorkerList}, Received);
         % from that moment on, we accumulate the count of passed tests
-        {worker_msg, #pass{performed = PassedRcvd, samples = SamplesRcvd}, From, Id}
+        {worker_msg, #pass{performed = PassedRcvd, samples = SamplesRcvd}, _From, Id}
                 when Samples == [none] ->
             NewImmResult = ImmResult#pass{performed = Passed + PassedRcvd,
                                           samples = SamplesRcvd},
-            aggregate_imm_result(WorkerList -- [From], NewImmResult);
-        {worker_msg, #pass{performed = PassedRcvd, samples = SamplesRcvd}, From, Id} ->
+            aggregate_imm_result({NumTests - 1, WorkerList}, NewImmResult);
+        {worker_msg, #pass{performed = PassedRcvd, samples = SamplesRcvd}, _From, Id} ->
             NewImmResult = ImmResult#pass{performed = Passed + PassedRcvd,
                                           samples = Samples ++ SamplesRcvd},
-            aggregate_imm_result(WorkerList -- [From], NewImmResult);
+            aggregate_imm_result({NumTests - 1, WorkerList}, NewImmResult);
         {worker_msg, #fail{performed = FailedOn} = Received, From, Id} ->
             lists:foreach(fun(P) ->
                             P ! {worker_msg, {failed_test, self()}, Id} end,
@@ -2184,12 +2202,12 @@ aggregate_imm_result(WorkerList, #pass{performed = Passed, samples = Samples} = 
                                 end
                              end, 0, WorkerList -- [From]),
             kill_workers(WorkerList),
-            aggregate_imm_result([], Received#fail{performed = Performed + FailedOn});
+            aggregate_imm_result({0, WorkerList}, Received#fail{performed = Performed + FailedOn});
         {worker_msg, {error, _Reason} = Error, _From, Id} ->
             kill_workers(WorkerList),
-            aggregate_imm_result([], Error);
+            aggregate_imm_result({0, WorkerList}, Error);
         {'EXIT', From, _ExcReason} ->
-            aggregate_imm_result(WorkerList -- [From], ImmResult)
+            aggregate_imm_result({NumTests, WorkerList -- [From]}, ImmResult)
     end.
 
 -spec report_imm_result(imm_result(), opts()) -> 'ok'.
@@ -2342,21 +2360,11 @@ report_shrinking(NumShrinks, MinImmTestCase, MinActions, Opts) ->
     print_imm_testcase(MinImmTestCase, "", Print),
     execute_actions(MinActions).
 
--spec tests_per_worker(list(pos_integer()), non_neg_integer(), list(pos_integer())) -> list(pos_integer()).
-tests_per_worker(L, 0, []) -> L;
-tests_per_worker(L, 0, Acc) -> Acc ++ L;
-tests_per_worker([], Extras, Acc) -> tests_per_worker(Acc, Extras, []);
-tests_per_worker([H|T], Extras, Acc) -> tests_per_worker(T, Extras - 1, Acc ++ [H + 1]).
-
--spec tests_per_worker(pos_integer(), non_neg_integer()) -> list(pos_integer()).
-tests_per_worker(NumTests, NumWorkers) when NumTests < NumWorkers ->
-    BaseList = lists:map(fun(_X) -> 1 end, lists:seq(1, NumTests)),
-    tests_per_worker(BaseList, 0, []);
-tests_per_worker(NumTests, NumWorkers) ->
-    Const = NumTests div NumWorkers,
-    Extras = NumTests rem NumWorkers,
-    BaseList = lists:map(fun(_X) -> Const end, lists:seq(1, NumWorkers)),
-    tests_per_worker(BaseList, Extras, []).
+-spec test_list_per_worker(pos_integer(), non_neg_integer()) -> [list(non_neg_integer())].
+test_list_per_worker(NumTests, NumWorkers) ->
+    L = lists:seq(1, NumWorkers),
+    Length = length(L),
+    lists:map(fun(X) -> lists:seq(X - 1, NumTests - 1, Length) end, L).
 
 %% @private
 -spec update_slave_node_ref({node(), {already_running, boolean()}}) -> list(node()).
