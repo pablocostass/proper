@@ -404,9 +404,6 @@
 
 -include("proper_internal.hrl").
 
-% No need to warn of this for now
--dialyzer({no_unused, [size_at_nth_test/2, perform/4]}).
-
 %%-----------------------------------------------------------------------------
 %% Macros
 %%-----------------------------------------------------------------------------
@@ -684,11 +681,14 @@ size_at_nth_test(NumTest, #opts{max_size = MaxSize, start_size = StartSize,
                     (NumTest div 2) - (Rem div Div) + StartSize
             end;
         false ->
-            case NumTest == 0 of
-                true -> StartSize;
-                false ->
-                    Diff = (SizesToTest - 1) div (NumTests - 1),
-                    NumTest * Diff + StartSize
+             if
+                NumTest == 0 -> StartSize;
+                NumTest == 1 ->
+                    Diff = (SizesToTest - 1) div NumTest,
+                    NumTest * Diff + StartSize;
+              true ->
+                Diff = (SizesToTest - 1) div (NumTest - 1),
+                NumTest * Diff + StartSize
             end
     end,
     case Size >= MaxSize of
@@ -1272,30 +1272,72 @@ property_type(_) -> {}.
 %% avoid test collisions between them.
 -spec perform_with_nodes(test(), opts()) -> imm_result().
 perform_with_nodes(Test, #opts{numtests = NumTests, num_workers = NumWorkers} = Opts) ->
-    TestsPerWorker = tests_per_worker(NumTests, NumWorkers),
+    {Rounds, K} = test_rounds(NumTests, NumWorkers),
     NodeList = case property_type(Test) of
         {kind, Type} when Type =:= constructed; Type =:= wrapper ->
             % stateful or simulated annealing
             Nodes = start_nodes(NumWorkers),
             ensure_code_loaded(Nodes),
-            lists:zip(Nodes, TestsPerWorker);
+            Prop = lists:flatten([lists:zip(Nodes, Round) || Round <- Rounds]),
+            lists:map(fun(Node) ->
+                          L = proplists:get_all_values(Node, Prop),
+                          Rounds2 = [[N] || N <- L],
+                          {Node, Rounds2}
+                      end, proplists:get_keys(Prop));
         _ ->
             % stateless
             [Node] = start_nodes(1),
             ensure_code_loaded([Node]),
-            lists:map(fun(N) -> {Node, N} end, TestsPerWorker)
+            [{Node, Rounds}]
     end,
     ok = ?disable_logging(),
     {ok, _} = maybe_start_cover_server(NodeList),
-    SpawnFun = fun({Node,N}) ->
-        spawn_link_migrate(Node, fun() -> perform(N, Test, Opts) end)
-    end,
-    WorkerList = lists:map(SpawnFun, NodeList),
     InitialResult = #pass{samples = [], printers = [], actions = []},
-    AggregatedImmResult = aggregate_imm_result(WorkerList, InitialResult),
+    AggregatedImmResult = do_rounds(K, InitialResult, 0, NodeList, Test, Opts),
     ok = maybe_stop_cover_server(NodeList),
     ok = stop_nodes(),
     AggregatedImmResult.
+
+%% @private
+-spec do_rounds(non_neg_integer(), imm_result(), non_neg_integer(), NodeList, test(), opts()) -> imm_result()
+      when NodeList :: Stateless | Stateful,
+           Stateless :: [{node(), [[integer()]]}],
+           Stateful :: [[{node(), integer()}]].
+do_rounds(0, ImmResult, _Start, _NodeList, _Test, _Opts) ->
+    ImmResult;
+do_rounds(K, ImmResult, Start, [{Node, [Round|T]}] = NodeList, Test, Opts) when length(NodeList) == 1 ->
+    {WorkerList, Passed} =
+        lists:mapfoldl(fun(N, Passed) ->
+                {spawn_link_migrate(Node, fun() -> perform(Start, N, Test, Opts) end), Passed + N}
+            end, 0, Round),
+
+    case aggregate_imm_result(WorkerList, ImmResult) of
+        #pass{} = Result ->
+            do_rounds(K - 1, Result, Start + Passed, [{Node, T}], Test, Opts);
+        Other ->
+            Other
+    end;
+do_rounds(K, ImmResult, Start, [{_Node, [_Round|_]}|_] = NodeList, Test, Opts) ->
+    {WL, {Passed, NNL}} =
+        lists:mapfoldl(fun({Node, [Round|T]}, {Passed, Acc}) ->
+                       {
+                          [spawn_link_migrate(Node, fun() -> perform(Start, N, Test, Opts) end) || N <- Round]
+                        , {
+                            lists:sum(Round) + Passed
+                          , [{Node, T}|Acc]
+                          }
+                        }
+                   end, {0, []}, NodeList),
+
+    WorkerList = lists:flatten(WL),
+    NewNodeList = lists:reverse(NNL),
+
+    case aggregate_imm_result(WorkerList, ImmResult) of
+        #pass{} = Result ->
+            do_rounds(K - 1, Result, Start + Passed, NewNodeList, Test, Opts);
+        Other ->
+            Other
+    end.
 
 -spec retry(test(), counterexample(), opts()) -> short_result().
 retry(Test, CExm, Opts) ->
@@ -2342,21 +2384,41 @@ report_shrinking(NumShrinks, MinImmTestCase, MinActions, Opts) ->
     print_imm_testcase(MinImmTestCase, "", Print),
     execute_actions(MinActions).
 
--spec tests_per_worker(list(pos_integer()), non_neg_integer(), list(pos_integer())) -> list(pos_integer()).
-tests_per_worker(L, 0, []) -> L;
-tests_per_worker(L, 0, Acc) -> Acc ++ L;
-tests_per_worker([], Extras, Acc) -> tests_per_worker(Acc, Extras, []);
-tests_per_worker([H|T], Extras, Acc) -> tests_per_worker(T, Extras - 1, Acc ++ [H + 1]).
+%% @private
+-spec test_rounds(pos_integer(), non_neg_integer()) -> {[[non_neg_integer()]], non_neg_integer()}.
+test_rounds(1, _NumWorkers) ->
+    K = 1,
+    {[[1]], K};
+test_rounds(NumTests, NumWorkers) ->
+    K = 4,
+    Const = NumTests div K,
+    Base = Const div NumWorkers,
+    Overflow = NumTests rem K,
+    ConstOverflow = Const rem NumWorkers,
+    Rounds = test_rounds(K, NumWorkers, Base, {ConstOverflow, Overflow}, []),
+    {Rounds, K}.
 
--spec tests_per_worker(pos_integer(), non_neg_integer()) -> list(pos_integer()).
-tests_per_worker(NumTests, NumWorkers) when NumTests < NumWorkers ->
-    BaseList = lists:map(fun(_X) -> 1 end, lists:seq(1, NumTests)),
-    tests_per_worker(BaseList, 0, []);
-tests_per_worker(NumTests, NumWorkers) ->
-    Const = NumTests div NumWorkers,
-    Extras = NumTests rem NumWorkers,
-    BaseList = lists:map(fun(_X) -> Const end, lists:seq(1, NumWorkers)),
-    tests_per_worker(BaseList, Extras, []).
+%% @private
+-spec test_rounds(integer(), integer(), integer(), {integer(), integer()}, Acc) -> Acc
+      when Acc :: [[non_neg_integer()]].
+test_rounds(0, _NumWorkers, _Base, _Overflow, Acc) ->
+    lists:reverse(Acc);
+test_rounds(K, NumWorkers, Base, {ConstOverflow, 0}, Acc) ->
+    BaseRound = [Base || _ <- lists:seq(1, NumWorkers)],
+    {A, _} = lists:mapfoldl(fun(N, 0) ->
+                                    {N, 0};
+                               (N, Times) ->
+                                    {N + 1, Times - 1}
+                            end, ConstOverflow, BaseRound),
+    test_rounds(K - 1, NumWorkers, Base, {ConstOverflow, 0}, [A|Acc]);
+test_rounds(K, NumWorkers, Base, {ConstOverflow, Overflow}, Acc) ->
+    BaseRound = [Base || _ <- lists:seq(1, NumWorkers)],
+    {A, O} = lists:mapfoldl(fun(N, 0) ->
+                                    {N, 0};
+                               (N, Times) ->
+                                    {N + 1, Times - 1}
+                            end, ConstOverflow + Overflow, BaseRound),
+    test_rounds(K - 1, NumWorkers, Base, {ConstOverflow, O}, [A|Acc]).
 
 %% @private
 -spec update_slave_node_ref({node(), {already_running, boolean()}}) -> list(node()).

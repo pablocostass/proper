@@ -1245,7 +1245,7 @@ adts2_test_() ->
     {timeout, 60,	% for 18.x (and onwards?)
      ?_passes(?FORALL({X,Y,D},
 		      {integer(),float(),dict:dict(integer(),float())},
-		      dict:fetch(X,dict:store(X,Y,eval(D))) =:= Y), [30])}.
+		      dict:fetch(X,dict:store(X,Y,eval(D))) =:= Y), [30,{num_workers,0}])}.
 
 adts3_test_() ->
      {timeout, 60,
