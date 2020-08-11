@@ -404,9 +404,6 @@
 
 -include("proper_internal.hrl").
 
-% No need to warn of this for now
--dialyzer({no_unused, [size_at_nth_test/2, perform/4]}).
-
 %%-----------------------------------------------------------------------------
 %% Macros
 %%-----------------------------------------------------------------------------
@@ -1273,8 +1270,8 @@ perform_with_nodes(Test, #opts{numtests = NumTests, num_workers = NumWorkers} = 
     end,
     ok = ?disable_logging(),
     {ok, _} = maybe_start_cover_server(NodeList),
-    SpawnFun = fun({Node,N}) ->
-        spawn_link_migrate(Node, fun() -> perform(N, Test, Opts) end)
+    SpawnFun = fun({Node,{Start, End}}) ->
+        spawn_link_migrate(Node, fun() -> perform(Start, End, Test, Opts) end)
     end,
     WorkerList = lists:map(SpawnFun, NodeList),
     InitialResult = #pass{samples = [], printers = [], actions = []},
@@ -2328,21 +2325,74 @@ report_shrinking(NumShrinks, MinImmTestCase, MinActions, Opts) ->
     print_imm_testcase(MinImmTestCase, "", Print),
     execute_actions(MinActions).
 
--spec tests_per_worker(list(pos_integer()), non_neg_integer(), list(pos_integer())) -> list(pos_integer()).
-tests_per_worker(L, 0, []) -> L;
-tests_per_worker(L, 0, Acc) -> Acc ++ L;
-tests_per_worker([], Extras, Acc) -> tests_per_worker(Acc, Extras, []);
-tests_per_worker([H|T], Extras, Acc) -> tests_per_worker(T, Extras - 1, Acc ++ [H + 1]).
+-spec even_tests_per_worker(WorkersLeft, Tuple, Acc) -> Acc
+      when  WorkersLeft :: non_neg_integer(),
+            Tuple :: {non_neg_integer(), non_neg_integer(), non_neg_integer()},
+            Acc :: [{non_neg_integer(), non_neg_integer()}].
+even_tests_per_worker(0, _, Acc) -> lists:reverse(Acc);
+even_tests_per_worker(WorkersLeft, {Const, Passed, 0}, Acc) ->
+    even_tests_per_worker(WorkersLeft - 1, {Const, Passed + Const, 0}, [{Passed, Const}|Acc]);
+even_tests_per_worker(WorkersLeft, {Const, Passed, Extras}, Acc) ->
+    even_tests_per_worker(WorkersLeft - 1, {Const, Passed + Const + 1, Extras - 1}, [{Passed, Const + 1}|Acc]).
 
--spec tests_per_worker(pos_integer(), non_neg_integer()) -> list(pos_integer()).
-tests_per_worker(NumTests, NumWorkers) when NumTests < NumWorkers ->
-    BaseList = lists:map(fun(_X) -> 1 end, lists:seq(1, NumTests)),
-    tests_per_worker(BaseList, 0, []);
+-spec tests_per_worker({WorkersLeft, Kind}, Tuple, Acc) -> [{non_neg_integer(), non_neg_integer()}]
+      when  WorkersLeft :: non_neg_integer(),
+            Kind :: 'even' | 'odd',
+            Tuple :: {non_neg_integer(), non_neg_integer(), non_neg_integer(), float()},
+            Acc :: [{non_neg_integer(), non_neg_integer(), integer()}].
+tests_per_worker({0, odd}, {Const, LastPassed, OverflowLeft, _}, Acc) ->
+    L = lists:reverse(Acc),
+    {L2, _, _} =
+        lists:foldl(fun({_P, N, O}, {A, Passed, 0}) ->
+                                    NumTests = (Const + O) - N + Const,
+                                    {A ++ [{Passed, NumTests}], Passed + NumTests, 0};
+                                ({_P, N, O1}, {A, Passed, O2}) ->
+                                    NumTests = (Const + O1) - N + (Const + O2),
+                                    {A ++ [{Passed, NumTests}], Passed + NumTests, O2 - 1}
+                    end, {[], LastPassed + Const, OverflowLeft}, Acc),
+    [{P,N} || {P,N,_} <- L] ++ [{LastPassed, Const}] ++ L2;
+tests_per_worker({0, even}, {Const, LastPassed, OverflowLeft, _}, Acc) ->
+    L = lists:reverse(Acc),
+    L1 = [{P,N} || {P,N,_} <- L],
+    {L2, _, _} =
+        lists:foldl(fun({_P, N, O}, {A, Passed, 0}) ->
+                                    NumTests = (Const + O) - N + Const,
+                                    {A ++ [{Passed, NumTests}], Passed + NumTests, 0};
+                             ({_P, N, O1}, {A, Passed, O2}) ->
+                                    NumTests = (Const + O1) - N + (Const + O2),
+                                    {A ++ [{Passed, NumTests}], Passed + NumTests, O2 - 1}
+                    end, {L1, LastPassed, OverflowLeft}, Acc),
+    L2;
+tests_per_worker({WorkersLeft, Kind}, {Const, Passed, 0, ExtraCut}, Acc) ->
+    NumTests = ceil(Const * (1 + ExtraCut/100)),
+    NewAcc = [{Passed, NumTests, 0}|Acc],
+    NewExtraCut = ExtraCut/2,
+    tests_per_worker({WorkersLeft - 1, Kind}, {Const, Passed + NumTests, 0, NewExtraCut}, NewAcc);
+tests_per_worker({WorkersLeft, Kind}, {Const, Passed, Extras, ExtraCut}, Acc) ->
+    NumTests = ceil((Const + 1) * (1 + ExtraCut/100)),
+    NewAcc = [{Passed, NumTests, 1}|Acc],
+    NewExtraCut = ExtraCut/2,
+    tests_per_worker({WorkersLeft - 1, Kind}, {Const, Passed + NumTests, Extras - 1, NewExtraCut}, NewAcc).
+
+-spec tests_per_worker(pos_integer(), non_neg_integer()) -> [{non_neg_integer(), non_neg_integer()}].
+tests_per_worker(NumTests, 1) ->
+    [{0, NumTests}];
 tests_per_worker(NumTests, NumWorkers) ->
     Const = NumTests div NumWorkers,
     Extras = NumTests rem NumWorkers,
-    BaseList = lists:map(fun(_X) -> Const end, lists:seq(1, NumWorkers)),
-    tests_per_worker(BaseList, Extras, []).
+    ExtraCut = 50.0,
+    Half = case NumWorkers rem 2 of
+        0 -> {floor(NumWorkers/2), even};
+        1 -> {floor(NumWorkers/2), odd}
+    end,
+
+    Uneven = tests_per_worker(Half, {Const, 0, Extras, ExtraCut}, []),
+    case lists:last(Uneven) of
+        {A, B} when A + B > NumTests ->
+            even_tests_per_worker(NumWorkers, {Const, 0, Extras}, []);
+        {_A, _B} ->
+            Uneven
+    end.
 
 %% @private
 -spec update_slave_node_ref({node(), {already_running, boolean()}}) -> list(node()).
