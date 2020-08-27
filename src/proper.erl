@@ -524,7 +524,7 @@
 		  | {'max_shrinks',non_neg_integer()}
 		  | {'max_size',proper_gen:size()}
 		  | {'numtests',pos_integer()}
-          | {'num_workers', non_neg_integer()}
+		  | {'num_workers', non_neg_integer()}
 		  | {'on_output',output_fun()}
 		  | {'search_steps',pos_integer()}
 		  | {'search_strategy',proper_target:strategy()}
@@ -551,9 +551,9 @@
 	       skip_mfas        = []              :: [mfa()],
 	       false_positive_mfas                :: false_positive_mfas(),
 	       setup_funs       = []              :: [setup_fun()],
-		   num_workers      = 1               :: non_neg_integer(),
-		   parent           = self()          :: pid(),
-               nocolors         = false           :: boolean()}).
+	       num_workers      = 1               :: non_neg_integer(),
+	       parent           = self()          :: pid(),
+	       nocolors         = false           :: boolean()}).
 -type opts() :: #opts{}.
 -record(ctx, {mode     = new :: 'new' | 'try_shrunk' | 'try_cexm',
 	      bound    = []  :: imm_testcase() | counterexample(),
@@ -731,7 +731,7 @@ global_state_init(#opts{start_size = StartSize, constraint_tries = CTries,
     grow_size(Opts),
     put('$constraint_tries', CTries),
     put('$any_type', AnyType),
-    put('$property_id', erlang:system_time()),
+    put('$property_id', erlang:unique_integer()),
     {_, _, _} = Seed, % just an assertion
     proper_arith:rand_restart(Seed),
     proper_typeserver:restart(),
@@ -783,11 +783,25 @@ finalize_test(Finalizers) ->
     lists:foreach(fun (Fun) -> ok = Fun() end, Finalizers).
 
 %% @private
+-spec get_all_application_envs() -> [{atom(), [{atom(), term()}]}].
+get_all_application_envs() ->
+    [begin
+        ParVal = application:get_all_env(Application),
+        {Application, ParVal}
+    end || {Application, _, _} <- application:loaded_applications()
+                                , Application /= stdlib
+                                , Application /= kernel].
+
+%% @private
 -spec spawn_link_migrate(node(), fun(() -> 'ok')) -> pid().
 spawn_link_migrate(Node, ActualFun) ->
     PDictStuff = get(),
+    ApplicationStuff = get_all_application_envs(),
     Fun = fun() ->
 	      lists:foreach(fun({K,V}) -> put(K,V) end, PDictStuff),
+          lists:foreach(fun({A,PV}) ->
+                            lists:foreach(fun({P,V}) -> application:set_env(A, P, V) end, PV)
+                        end, ApplicationStuff),
 	      proper_arith:rand_reseed(),
 	      ok = ActualFun()
 	  end,
@@ -1240,6 +1254,7 @@ inner_test(RawTest, Opts) ->
 	false -> ShortResult
     end.
 
+%% @private
 -spec property_type(test()) -> tuple() | false.
 property_type({forall, {_, {'$type', TList}}, _}) when is_list(TList) ->
    lists:keyfind(kind, 1, TList);
@@ -1258,8 +1273,7 @@ property_type(_) -> {}.
 -spec perform_with_nodes(test(), opts()) -> imm_result().
 perform_with_nodes(Test, #opts{numtests = NumTests, num_workers = NumWorkers} = Opts) ->
     TestsPerWorker = tests_per_worker(NumTests, NumWorkers),
-    NodeList =
-    case property_type(Test) of
+    NodeList = case property_type(Test) of
         {kind, Type} when Type =:= constructed; Type =:= wrapper ->
             % stateful or simulated annealing
             Nodes = start_nodes(NumWorkers),
@@ -1383,12 +1397,12 @@ get_rerun_result(#fail{}) ->
 get_rerun_result({error,_Reason} = ErrorResult) ->
     ErrorResult.
 
--spec check_if_early_fail(non_neg_integer(), sample()) -> 'ok'.
-check_if_early_fail(Passed, Samples) ->
+-spec check_if_early_fail(non_neg_integer()) -> 'ok'.
+check_if_early_fail(Passed) ->
     Id = get('$property_id'),
     receive
         {worker_msg, {failed_test, From}, Id} ->
-            From ! {worker_msg, {performed, {Passed, Samples}, Id}},
+            From ! {worker_msg, {performed, Passed, Id}},
             ok
         after 0 -> ok
     end.
@@ -1401,7 +1415,7 @@ perform(NumTests, Test, Opts) ->
 perform(Passed, NumTests, Test, Opts) ->
     Size = size_at_nth_test(Passed, Opts),
     put('$size', Size),
-    perform(0, NumTests, ?MAX_TRIES_FACTOR * NumTests, Test, none, none, Opts).
+    perform(0, NumTests, 3 * ?MAX_TRIES_FACTOR * NumTests, Test, none, none, Opts).
 
 -spec perform(non_neg_integer(), pos_integer(), non_neg_integer(), test(),
 	      [sample()] | 'none', [stats_printer()] | 'none', opts()) ->
@@ -1422,14 +1436,14 @@ perform(Passed, _ToPass, 0, _Test, Samples, Printers, _Opts) ->
 perform(ToPass, ToPass, _TriesLeft, _Test, Samples, Printers,
         #opts{num_workers = NumWorkers, parent = From} = _Opts) when NumWorkers > 0 ->
     R = #pass{samples = Samples, printers = Printers, performed = ToPass, actions = []},
-    check_if_early_fail(ToPass, Samples),
+    check_if_early_fail(ToPass),
     From ! {worker_msg, R, self(), get('$property_id')},
     ok;
 perform(ToPass, ToPass, _TriesLeft, _Test, Samples, Printers, _Opts) ->
     #pass{samples = Samples, printers = Printers, performed = ToPass, actions = []};
 perform(Passed, ToPass, TriesLeft, Test, Samples, Printers,
         #opts{output_fun = Print, num_workers = NumWorkers, parent = From} = Opts) when NumWorkers > 0 ->
-    check_if_early_fail(Passed, Samples),
+    check_if_early_fail(Passed),
     case run(Test, Opts) of
 	#pass{reason = true_prop, samples = MoreSamples,
 	      printers = MorePrinters} ->
@@ -2409,11 +2423,10 @@ maybe_load_binary(Nodes, Module) ->
 ensure_code_loaded(Nodes) ->
     %% get all the files that need to be loaded from the current directory
     Files = filelib:wildcard("**/*.beam"),
-    Filenames = lists:map(fun filename:basename/1, Files),
     %% but we only need the filename without the .beam extension
-    Modules = lists:map(fun(File) ->
-                  erlang:list_to_atom(re:replace(File, ".beam", "", [{return,list}]))
-              end, Filenames),
+    Modules = lists:map(fun(F) ->
+                    erlang:list_to_atom(filename:basename(F, ".beam"))
+                end, Files),
 
     %% call the functions needed to ensure that all modules are available on the nodes
     lists:foreach(fun(Module) -> maybe_load_binary(Nodes, Module) end, Modules),
