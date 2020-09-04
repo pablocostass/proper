@@ -684,7 +684,10 @@ size_at_nth_test(NumTest, #opts{max_size = MaxSize, start_size = StartSize,
             case NumTest == 0 of
                 true -> StartSize;
                 false ->
-                    Diff = (SizesToTest - 1) div (NumTests - 1),
+                    Diff = case NumTests of
+                        1 -> (SizesToTest - 1);
+                        _ -> (SizesToTest - 1) div (NumTests - 1)
+                    end,
                     NumTest * Diff + StartSize
             end
     end,
@@ -1272,18 +1275,24 @@ property_type(_) -> {}.
 -spec perform_with_nodes(test(), opts()) -> imm_result().
 perform_with_nodes(Test, #opts{numtests = NumTests, num_workers = NumWorkers} = Opts) ->
     TestsPerWorker = test_list_per_worker(NumTests, NumWorkers),
+    T1 = erlang:monotonic_time(),
     NodeList = case property_type(Test) of
         {kind, Type} when Type =:= constructed; Type =:= wrapper ->
             % stateful or simulated annealing
+            io:format("Stateful prop~n"),
             Nodes = start_nodes(NumWorkers),
             ensure_code_loaded(Nodes),
             lists:zip(Nodes, TestsPerWorker);
         _ ->
             % stateless
+            io:format("Stateless prop~n"),
             [Node] = start_nodes(1),
             ensure_code_loaded([Node]),
             lists:map(fun(N) -> {Node, N} end, TestsPerWorker)
     end,
+    T2 = erlang:monotonic_time(),
+    Time = erlang:convert_time_unit(T2 - T1, native, microsecond),
+    io:format("Time lost starting nodes (~p workers): ~p~n", [NumWorkers, Time]),
     ok = ?disable_logging(),
     {ok, _} = maybe_start_cover_server(NodeList),
     SpawnFun = fun({Node, {Start, ToPass}}) ->
@@ -1293,7 +1302,7 @@ perform_with_nodes(Test, #opts{numtests = NumTests, num_workers = NumWorkers} = 
     InitialResult = #pass{samples = [], printers = [], actions = []},
     AggregatedImmResult = aggregate_imm_result(WorkerList, InitialResult),
     ok = maybe_stop_cover_server(NodeList),
-    ok = stop_nodes(),
+    %ok = stop_nodes(),
     AggregatedImmResult.
 
 -spec retry(test(), counterexample(), opts()) -> short_result().
@@ -1407,13 +1416,6 @@ check_if_early_fail() ->
         after 0 -> ok
     end.
 
--spec update_tests_passed(non_neg_integer()) -> non_neg_integer().
-update_tests_passed(Passed) ->
-    case get('$tests_passed') of
-        undefined -> put('$tests_passed', Passed);
-        Passed2 -> put('$tests_passed', Passed + Passed2)
-    end.
-
 -spec perform(non_neg_integer(), test(), opts()) -> imm_result() | 'ok'.
 perform(NumTests, Test, Opts) ->
     perform(0, NumTests, ?MAX_TRIES_FACTOR * NumTests, Test, none, none, Opts).
@@ -1433,7 +1435,6 @@ perform(Passed, _ToPass, 0, _Test, Samples, Printers,
         0 -> {error, cant_satisfy};
         _ -> #pass{samples = Samples, printers = Printers, performed = Passed, actions = []}
     end,
-    update_tests_passed(Passed),
     From ! {worker_msg, R, self(), get('$property_id')},
     ok;
 perform(Passed, _ToPass, 0, _Test, Samples, Printers, _Opts) ->
@@ -1447,7 +1448,7 @@ perform(ToPass, ToPass, _TriesLeft, _Test, Samples, Printers,
     check_if_early_fail(),
     From ! {worker_msg, R#pass{performed = floor(ToPass div NumWorkers + 1)}, self(), get('$property_id')},
     ok;
-perform(ToPass, ToPass, _TriesLeft, _Test, Samples, Printers, _Opts) ->
+perform(Passed, ToPass, _TriesLeft, _Test, Samples, Printers, _Opts) when Passed >= ToPass ->
     #pass{samples = Samples, printers = Printers, performed = ToPass, actions = []};
 perform(Passed, ToPass, TriesLeft, Test, Samples, Printers,
         #opts{output_fun = Print, num_workers = NumWorkers, parent = From} = Opts) when NumWorkers > 0 ->
@@ -1461,8 +1462,9 @@ perform(Passed, ToPass, TriesLeft, Test, Samples, Printers,
 			      none -> MorePrinters;
 			      _    -> Printers
 			  end,
-	    grow_size(Opts),
-        update_tests_passed(floor((Passed + 1) div NumWorkers + 1)),
+	    %grow_size(Opts),
+        NewSize = size_at_nth_test(Passed + get('$proper_test_incr'), Opts),
+        put('$size', NewSize),
 	    perform(Passed + get('$proper_test_incr'), ToPass, TriesLeft - 1, Test,
 		    NewSamples, NewPrinters, Opts);
 	#fail{} = FailResult ->
@@ -2164,23 +2166,19 @@ apply_skip(Args, Prop) ->
 %%-----------------------------------------------------------------------------
 
 -spec aggregate_imm_result(list(pid()), imm_result()) -> imm_result().
+aggregate_imm_result([], #pass{performed = Passed} = ImmResult) ->
+    ImmResult#pass{performed = Passed - get('$proper_test_incr')};
 aggregate_imm_result([], ImmResult) ->
     ImmResult;
-aggregate_imm_result(WorkerList, #pass{performed = Passed, samples = Samples} = ImmResult) ->
+aggregate_imm_result(WorkerList, #pass{performed = Passed} = ImmResult) ->
     Id = get('$property_id'),
     receive
         % if we haven't received anything yet we use the first pass
         {worker_msg, #pass{} = Received, From, Id} when Passed == undefined ->
             aggregate_imm_result(WorkerList -- [From], Received);
         % from that moment on, we accumulate the count of passed tests
-        {worker_msg, #pass{performed = PassedRcvd, samples = SamplesRcvd}, From, Id}
-                when Samples == [none] ->
-            NewImmResult = ImmResult#pass{performed = Passed + PassedRcvd,
-                                          samples = SamplesRcvd},
-            aggregate_imm_result(WorkerList -- [From], NewImmResult);
-        {worker_msg, #pass{performed = PassedRcvd, samples = SamplesRcvd}, From, Id} ->
-            NewImmResult = ImmResult#pass{performed = Passed + PassedRcvd,
-                                          samples = Samples ++ SamplesRcvd},
+        {worker_msg, #pass{performed = PassedRcvd}, From, Id} ->
+            NewImmResult = ImmResult#pass{performed = Passed + PassedRcvd, samples = []},
             aggregate_imm_result(WorkerList -- [From], NewImmResult);
         {worker_msg, #fail{performed = FailedOn} = Received, From, Id} ->
             lists:foreach(fun(P) ->
@@ -2360,17 +2358,21 @@ test_list_per_worker(NumTests, NumWorkers) ->
     Seq = lists:seq(1, NumWorkers),
     lists:map(fun(X) ->
                   L2 = lists:seq(X - 1, NumTests - Decr, NumWorkers),
-                  {_Start, _NumTests} = {hd(L2), lists:last(L2)}
+                  {_Start, _NumTests} = {hd(L2), lists:last(L2) + NumWorkers}
               end, Seq).
 
 %% @private
 -spec update_slave_node_ref({node(), {already_running, boolean()}}) -> list(node()).
-update_slave_node_ref(Node) ->
-    NewMap = case get(slave_node) of
-        undefined -> [Node];
-        Map -> [Node|Map]
-    end,
-    put(slave_node, NewMap).
+update_slave_node_ref({Node, {already_running, _Bool}} = Tuple) ->
+    NewTupleList = case get(slave_node) of
+        undefined -> [Tuple];
+        TupleList ->
+            case lists:keyfind(Node, 1, TupleList) of
+                false -> [Tuple|TupleList];
+                _Tuple -> lists:keyreplace(Node, 1, TupleList, Tuple)
+            end
+     end,
+    put(slave_node, NewTupleList).
 
 %% @private
 %% @doc Starts a remote node to ensure the testing will not
@@ -2412,8 +2414,11 @@ maybe_stop_cover_server(NodeList) ->
 maybe_load_binary(Nodes, Module) ->
     %% we check if the module was either preloaded or cover_compiled
     %% and in such cases ignore those
-    case code:is_loaded(Module) of
-        {file, Loaded} when is_list(Loaded) ->
+    IsLoaded = code:is_loaded(Module),
+    IsSticky = code:is_sticky(Module),
+    case {IsSticky, IsLoaded} of
+        {true, _} -> ok;
+        {false, {file, Loaded}} when is_list(Loaded) ->
             case code:get_object_code(Module) of
                 {Module, Binary, Filename} ->
                     _ = rpc:multicall(Nodes, code, load_binary, [Module, Filename, Binary]),
@@ -2423,7 +2428,6 @@ maybe_load_binary(Nodes, Module) ->
         _ -> ok
     end.
 
-%% @private
 -spec ensure_code_loaded([node()]) -> 'ok'.
 ensure_code_loaded(Nodes) ->
     %% get all the files that need to be loaded from the current directory
