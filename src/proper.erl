@@ -549,6 +549,7 @@
 	       false_positive_mfas                :: false_positive_mfas(),
 	       setup_funs       = []              :: [setup_fun()],
 	       num_workers      = 1               :: non_neg_integer(),
+	       nodes            = []              :: [node()],
 	       parent           = self()          :: pid(),
 	       nocolors         = false           :: boolean()}).
 -type opts() :: #opts{}.
@@ -999,6 +1000,7 @@ parse_opts([], Opts) ->
 parse_opts([UserOpt | Rest], Opts) ->
     parse_opts(Rest, parse_opt(UserOpt,Opts)).
 
+-define(NON_EMPTY_LIST(L), (is_list(L) andalso length(L) > 0)).
 -define(POS_INTEGER(N),     (is_integer(N) andalso N > 0)).
 -define(NON_NEG_INTEGER(N), (is_integer(N) andalso N >= 0)).
 -define(VALIDATE_OPT(Check, NewOpts),
@@ -1032,6 +1034,8 @@ parse_opt(UserOpt, Opts) ->
 	    ?VALIDATE_OPT(?NON_NEG_INTEGER(N), Opts#opts{max_shrinks = N});
 	{max_size,Size} ->
 	    ?VALIDATE_OPT(?NON_NEG_INTEGER(Size), Opts#opts{max_size = Size});
+    {nodes,Nodes} ->
+        ?VALIDATE_OPT(?NON_EMPTY_LIST(Nodes), Opts#opts{nodes = Nodes});
 	{numtests,N} ->
 	    ?VALIDATE_OPT(?POS_INTEGER(N), Opts#opts{numtests = N});
     {num_workers,N} ->
@@ -1266,6 +1270,27 @@ property_type({forall, {_, TList}, _}) when is_list(TList) ->
    lists:keyfind(kind, 1, TList);
 property_type(_) -> {}.
 
+-spec handle_stateful_property_nodes(any(), any()) -> 'ok'.
+handle_stateful_property_nodes(NumWorkers, Nodes) ->
+    LenNodes = length(Nodes),
+    WorkerNodes = if
+        %% We have been given fewer nodes than workers should be spawned.
+        %% As we are dealing with stateful properties, we have to start
+        %% extra nodes. Let's try to start them in the machines where the nodes
+        %% we've been given are.
+        NumWorkers > LenNodes ->
+            Nodes ++ start_remote_worker_nodes(NumWorkers - length(Nodes), {Nodes, Nodes});
+        %% We have been given more nodes than we need. We use only `NumWorker' nodes.
+        NumWorkers < LenNodes ->
+            lists:sublist(Nodes, NumWorkers);
+        %% We have been given as many nodes as workers should be spawned.
+        true ->
+            Nodes
+    end,
+    io:format("WorkerNodes = ~p~n", [WorkerNodes]),
+    ensure_code_loaded(WorkerNodes),
+    WorkerNodes.
+
 %% @private
 %% @doc Runs PropEr in parallel mode, through the use of workers to perform the tests.
 %% Under this mode, PropEr will try to detect if a property is stateless or stateful,
@@ -1273,23 +1298,25 @@ property_type(_) -> {}.
 %% latter case it will start a node for every worker that will be spawned in order to
 %% avoid test collisions between them.
 -spec perform_with_nodes(test(), opts()) -> imm_result().
-perform_with_nodes(Test, #opts{numtests = NumTests, num_workers = NumWorkers} = Opts) ->
+perform_with_nodes(Test, #opts{numtests = NumTests, num_workers = NumWorkers,
+        nodes = []} = Opts) ->
     TestsPerWorker = test_list_per_worker(NumTests, NumWorkers),
     T1 = erlang:monotonic_time(),
     NodeList = case property_type(Test) of
         {kind, Type} when Type =:= constructed; Type =:= wrapper ->
             % stateful or simulated annealing
             io:format("Stateful prop~n"),
-            Nodes = start_nodes(NumWorkers),
+            Nodes = start_worker_nodes(NumWorkers),
             ensure_code_loaded(Nodes),
             lists:zip(Nodes, TestsPerWorker);
         _ ->
             % stateless
             io:format("Stateless prop~n"),
-            [Node] = start_nodes(1),
+            [Node] = start_worker_nodes(1),
             ensure_code_loaded([Node]),
             lists:map(fun(N) -> {Node, N} end, TestsPerWorker)
     end,
+    io:format("NodeList = ~p~n", [NodeList]),
     T2 = erlang:monotonic_time(),
     Time = erlang:convert_time_unit(T2 - T1, native, microsecond),
     io:format("Time lost starting nodes (~p workers): ~p~n", [NumWorkers, Time]),
@@ -1299,6 +1326,42 @@ perform_with_nodes(Test, #opts{numtests = NumTests, num_workers = NumWorkers} = 
         spawn_link_migrate(Node, fun() -> perform(Start, ToPass, Test, Opts) end)
     end,
     WorkerList = lists:map(SpawnFun, NodeList),
+    InitialResult = #pass{samples = [], printers = [], actions = []},
+    AggregatedImmResult = aggregate_imm_result(WorkerList, InitialResult),
+    ok = maybe_stop_cover_server(NodeList),
+    %ok = stop_nodes(),
+    AggregatedImmResult;
+perform_with_nodes(Test, #opts{numtests = NumTests, num_workers = NumWorkers,
+        nodes = Nodes} = Opts) ->
+    TestsPerWorker = test_list_per_worker(NumTests, NumWorkers),
+    io:format("TestsPerWorker = ~p~n", [TestsPerWorker]),
+    T1 = erlang:monotonic_time(),
+    NodeList = case property_type(Test) of
+        {kind, Type} when Type =:= constructed; Type =:= wrapper ->
+            % stateful or simulated annealing
+            io:format("Stateful prop~n"),
+            start_main_node(true),
+            WorkerNodes = handle_stateful_property_nodes(NumWorkers, Nodes),
+            lists:zip(WorkerNodes, TestsPerWorker);
+        _ ->
+            % stateless
+            io:format("Stateless prop~n"),
+            Node = hd(Nodes),
+            start_main_node(false),
+            ensure_code_loaded([Node]),
+            lists:map(fun(N) -> {Node, N} end, TestsPerWorker)
+    end,
+    io:format("NodeList = ~p~n", [NodeList]),
+    T2 = erlang:monotonic_time(),
+    Time = erlang:convert_time_unit(T2 - T1, native, microsecond),
+    io:format("Time lost starting nodes (~p workers): ~p~n", [NumWorkers, Time]),
+    ok = ?disable_logging(),
+    {ok, _} = maybe_start_cover_server(NodeList),
+    SpawnFun = fun({Node, {Start, ToPass}}) ->
+        spawn_link_migrate(Node, fun() -> perform(Start, ToPass, Test, Opts) end)
+    end,
+    WorkerList = lists:map(SpawnFun, NodeList),
+    io:format("WorkerList = ~p~n", [WorkerList]),
     InitialResult = #pass{samples = [], printers = [], actions = []},
     AggregatedImmResult = aggregate_imm_result(WorkerList, InitialResult),
     ok = maybe_stop_cover_server(NodeList),
@@ -2186,6 +2249,7 @@ aggregate_imm_result(WorkerList, #pass{performed = Passed} = ImmResult) ->
                     WorkerList -- [From]),
             Performed = lists:foldl(fun(Worker, Acc) ->
                                 receive
+                                    {worker_msg, {performed, undefined, Id}} -> Acc;
                                     {worker_msg, {performed, P, Id}} -> P + Acc;
                                     {worker_msg, #fail{performed = FailedOn2}, Worker, Id} -> FailedOn2 + Acc
                                 end
@@ -2362,9 +2426,9 @@ test_list_per_worker(NumTests, NumWorkers) ->
               end, Seq).
 
 %% @private
--spec update_slave_node_ref({node(), {already_running, boolean()}}) -> list(node()).
-update_slave_node_ref({Node, {already_running, _Bool}} = Tuple) ->
-    NewTupleList = case get(slave_node) of
+-spec update_worker_node_ref({node(), {already_running, boolean()}}) -> list(node()).
+update_worker_node_ref({Node, {already_running, _Bool}} = Tuple) ->
+    NewTupleList = case get(worker_node) of
         undefined -> [Tuple];
         TupleList ->
             case lists:keyfind(Node, 1, TupleList) of
@@ -2372,24 +2436,54 @@ update_slave_node_ref({Node, {already_running, _Bool}} = Tuple) ->
                 _Tuple -> lists:keyreplace(Node, 1, TupleList, Tuple)
             end
      end,
-    put(slave_node, NewTupleList).
+    put(worker_node, NewTupleList).
+
+%% @private
+%% @doc Starts the main node.
+start_main_node(LongNames) ->
+    [] = os:cmd("epmd -daemon"),
+    case LongNames of
+        false -> net_kernel:start([proper_main, shortnames]);
+        true ->
+            HostName = net_adm:localhost(),
+            Name = list_to_atom("proper_main@" ++ HostName),
+            net_kernel:start([Name, longnames])
+    end,
+    ok.
 
 %% @private
 %% @doc Starts a remote node to ensure the testing will not
 %% crash the BEAM, and loads on it all the needed code.
--spec start_node(node()) -> node().
-start_node(SlaveName) ->
-    [] = os:cmd("epmd -daemon"),
+-spec start_worker_node(node()) -> node().
+start_worker_node(WorkerName) ->
     HostName = list_to_atom(net_adm:localhost()),
-    _ = net_kernel:start([proper_master, shortnames]),
-    case slave:start_link(HostName, SlaveName) of
+    case slave:start_link(HostName, WorkerName) of
         {ok, Node} ->
-            _ = update_slave_node_ref({Node, {already_running, false}}),
+            _ = update_worker_node_ref({Node, {already_running, false}}),
             Node;
         {error, {already_running, Node}} ->
-            _ = update_slave_node_ref({Node, {already_running, true}}),
+            _ = update_worker_node_ref({Node, {already_running, true}}),
             Node
     end.
+
+start_remote_worker_nodes(0, _) -> [];
+start_remote_worker_nodes(WorkersLeft, {[], Nodes}) ->
+    start_remote_worker_nodes(WorkersLeft, {Nodes, Nodes});
+start_remote_worker_nodes(WorkersLeft, {[Node|T], Nodes}) ->
+    %% Get remote node IP to use as hostname
+    {ok, {IP0, IP1, IP2, IP3}} = rpc:call(Node, inet, getaddr, [net_adm:localhost(), inet]),
+    HostName = list_to_atom(integer_to_list(IP0) ++ "." ++ integer_to_list(IP1) ++ "."
+        ++ integer_to_list(IP2) ++ "." ++ integer_to_list(IP3)),
+    WorkerName = list_to_atom("proper_worker_" ++ integer_to_list(rand:uniform(WorkersLeft))),
+    WorkerNode = case rpc:call(Node, slave, start_link, [HostName, WorkerName, "-setcookie PROPERTESTING"]) of
+        {ok, Node1} ->
+            _ = update_worker_node_ref({Node1, {already_running, false}}),
+            Node1;
+        {error, {already_running, Node1}} ->
+            _ = update_worker_node_ref({Node1, {already_running, true}}),
+            Node1
+    end,
+    [WorkerNode|start_remote_worker_nodes(WorkersLeft - 1, {T, Nodes})].
 
 -spec maybe_start_cover_server([tuple()]) -> {'ok', [node()]}.
 maybe_start_cover_server(NodeList) ->
@@ -2445,24 +2539,24 @@ ensure_code_loaded(Nodes) ->
 
 %% @private
 %% @doc Starts multiple (NumNodes) remote nodes.
--spec start_nodes(non_neg_integer()) -> list(node()).
-start_nodes(NumNodes) ->
-    StartNode =
-    fun(N) ->
-        SlaveName = list_to_atom("proper_slave_" ++ integer_to_list(N)),
-        _ = start_node(SlaveName)
-    end,
+-spec start_worker_nodes(non_neg_integer()) -> list(node()).
+start_worker_nodes(NumNodes) ->
+    start_main_node(false),
+    StartNode = fun(N) ->
+                    WorkerName = list_to_atom("proper_worker_" ++ integer_to_list(N)),
+                    _ = start_worker_node(WorkerName)
+                end,
     lists:map(StartNode, lists:seq(1, NumNodes)).
 
 %% @private
 %% @doc Stops all the registered (started) nodes.
 -spec stop_nodes() -> 'ok'.
 stop_nodes() ->
-    Nodes = get(slave_node),
+    Nodes = get(worker_node),
     NodesToStop = lists:filter(fun({_N, {already_running, Bool}}) -> not Bool end, Nodes),
     lists:foreach(fun({Node, _}) -> slave:stop(Node) end, NodesToStop),
     _ = net_kernel:stop(),
-    erase(slave_node),
+    erase(worker_node),
     ok.
 
 %% @private
