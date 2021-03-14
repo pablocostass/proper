@@ -35,7 +35,7 @@ jobs:
         uses: actions/cache@v2
         with:
           path: .plt
-          key: ${{ runner.os }}-otp-${{ matrix.otp }}
+          key: ${{ runner.os }}-otp-v2-${{ matrix.otp }}
       - name: Test everything
         run: make all
 
