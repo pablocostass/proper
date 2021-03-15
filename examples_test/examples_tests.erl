@@ -79,14 +79,14 @@
 %% test the properties of the `magic' example.
 example_magic_props_test_() ->
   %% no point shrinking testx executed only for checking that they fail
-  FailOpts = [{numtests,10000}, noshrink],
+  FailOpts = [{numtests,10000}, noshrink, {num_workers,0}],
   [?_passes(magic:prop_spells_random(), [500]),  % let's hope we are unlucky
    {timeout, 180, ?_fails(magic:prop_spells_targeted_auto(), FailOpts)},
    {timeout, 180, ?_fails(magic:prop_spells_targeted_user(), FailOpts)}].
 
 %% test the unary properties of the `labyrinth' example.
 example_labyrinth_props_test_() ->
-  FailOpts = [{numtests,7500}, noshrink],        % see comment above
+  FailOpts = [{numtests,7500}, noshrink, {num_workers,0}],        % see comment above
   M0 = labyrinth:maze(0), M1 = labyrinth:maze(1), M2 = labyrinth:maze(2),
   [?_failsWith([[left,left,left,left,left,left]],       % run 500 tests,
                labyrinth:prop_exit_random(M0), [500]),  % for safety
@@ -110,14 +110,14 @@ example_mastermind_props_test_() ->
 
 %% test the properties of `car_statem' example.
 example_car_statem_props_test_() ->
-  FailOpts = [{numtests,1000}, noshrink],
+  FailOpts = [{numtests,1000}, noshrink, {num_workers,0}],
   [{timeout, 42, ?_passes(car_statem:prop_distance(), [500])},
    {timeout, 42, ?_fails(car_statem:prop_distance_targeted(), FailOpts)},
    {timeout, 42, ?_fails(car_statem:prop_distance_targeted_init(), FailOpts)}].
 
 %% test the properties of `car_fsm' example.
 example_car_fsm_props_test_() ->
-  FailOpts = [{numtests,1000}, noshrink],
+  FailOpts = [{numtests,1000}, noshrink, {num_workers,0}],
   [{timeout, 42, ?_passes(car_fsm:prop_distance(), [500])},
    {timeout, 42, ?_fails(car_fsm:prop_distance_targeted(), FailOpts)},
    {timeout, 42, ?_fails(car_fsm:prop_distance_targeted_init(), FailOpts)}].
