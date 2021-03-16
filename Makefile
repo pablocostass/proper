@@ -53,9 +53,9 @@ check_escripts:
 
 test: compile
 ifeq ($(COVER), true)
-	$(REBAR3) do eunit -c, cover, covertool generate
+	$(REBAR3) do eunit --verbose -c, cover, covertool generate
 else
-	$(REBAR3) eunit
+	$(REBAR3) eunit --verbose
 endif
 
 test-examples:
