@@ -108,16 +108,16 @@ example_mastermind_props_test_() ->
    |[{timeout, 10,
       ?_passes(mastermind:Prop(S))} || Prop <- Properties, S <- Strategies]].
 
-%% test the properties of `car_statem' example.
+% test the properties of `car_statem' example.
 example_car_statem_props_test_() ->
   FailOpts = [{numtests,1000}, noshrink, {num_workers,0}],
-  [{timeout, 42, ?_passes(car_statem:prop_distance(), [500])},
+  [{timeout, 42, ?_passes(car_statem:prop_distance(), [500,impure])},
    {timeout, 42, ?_fails(car_statem:prop_distance_targeted(), FailOpts)},
    {timeout, 42, ?_fails(car_statem:prop_distance_targeted_init(), FailOpts)}].
 
 %% test the properties of `car_fsm' example.
 example_car_fsm_props_test_() ->
   FailOpts = [{numtests,1000}, noshrink, {num_workers,0}],
-  [{timeout, 42, ?_passes(car_fsm:prop_distance(), [500])},
+  [{timeout, 42, ?_passes(car_fsm:prop_distance(), [500,impure])},
    {timeout, 42, ?_fails(car_fsm:prop_distance_targeted(), FailOpts)},
    {timeout, 42, ?_fails(car_fsm:prop_distance_targeted_init(), FailOpts)}].
