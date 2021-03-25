@@ -46,16 +46,16 @@ dialyzer: .plt/proper_plt compile
 	dialyzer -n -nn --plt $< -Wunmatched_returns -Wunknown ebin
 
 .plt/proper_plt: .plt
-	dialyzer --build_plt --output_plt $@ --apps erts kernel stdlib compiler crypto syntax_tools eunit
+	dialyzer --build_plt --output_plt $@ --apps erts kernel stdlib compiler crypto syntax_tools eunit tools
 
 check_escripts:
 	./scripts/check_escripts.sh make_doc
 
 test: compile
 ifeq ($(COVER), true)
-	$(REBAR3) do eunit -c, cover, covertool generate
+	$(REBAR3) do eunit --verbose -c, cover, covertool generate
 else
-	$(REBAR3) eunit
+	$(REBAR3) eunit --verbose
 endif
 
 test-examples:
